@@ -10,7 +10,7 @@ const Spectronaut_Scopes = ["PG", "PEP", "EG", "R"]
 
 function ColumnGroupDef(name::Symbol,
     columns::Union{AbstractVector, Nothing};
-    update_report!::Union{Function, Nothing}=nothing,
+    required::Bool = false,
     update_coldata::Union{Function, Nothing}=nothing
 )
     rename_regexs = Vector{Pair{Regex, SubstitutionString{String}}}()
@@ -35,7 +35,7 @@ function ColumnGroupDef(name::Symbol,
         end
         push!(rename_regexs, subst)
     end
-    return MSImport.ColumnGroupDef(name, rename_regexs, update_report!, update_coldata)
+    return MSImport.ColumnGroupDef(name, required, rename_regexs, update_coldata)
 end
 
 # data column groups in proteins report
@@ -59,18 +59,15 @@ const Spectronaut_ColumnGroupDefs = [
                                 "PG.Genes" => "gene_names", "PG.ProteinNames" => "protein_names",
                                 "PG.ProteinDescription" => "protein_descriptions",
                                 "PG.Organisms" => "organisms",
-                                "PG.Qvalue" => "qvalue"],
-                   update_report! = MSImport.update_protgroup_report!),
+                                "PG.Qvalue" => "qvalue"], required=true),
     ColumnGroupDef(:pepmodstate, ["EG.PrecursorId" => "pepmodstate_seq",
                                   "EG.ModifiedSequence" => "pepmod_seq",
-                                  "EG.IsDecoy" => "is_decoy"],
-                   update_report! = MSImport.update_pepmodstate_report!),
+                                  "EG.IsDecoy" => "is_decoy"]),
     ColumnGroupDef(:peptide, ["PEP.PeptidePosition" => "peptide_poses",
                               "PEP.IsProteinGroupSpecific" => "is_specific_peptide",
-                              "PEP.AllOccurringProteinAccessions" => "peptide_protein_acs"],
-                   update_report! = MSImport.update_peptide_report!),
+                              "PEP.AllOccurringProteinAccessions" => "peptide_protein_acs"]),
     ColumnGroupDef(:msrun, ["R.FileName" => "rawfile",
-                            "R.Replicate" => "msrun_ix"]),
+                            "R.Replicate" => "msrun_ix"], required=true),
     ColumnGroupDef(:metrics, ["\\.PTMLocalizationProbabilities" => "locprob_seq",
                               ])
 ]
@@ -80,7 +77,7 @@ const Spectronaut_ColumnGroupDef_Map =
 
 read_report(file_path::AbstractString; kwargs...) =
     MSImport.read_wide_table(file_path, Spectronaut_ColumnGroupDef_Map;
-        missingstrings = Spectronaut_NAs,
+        missingstring = Spectronaut_NAs,
         truestrings=["+", "True"], falsestrings=["", "False"],
         kwargs...)
 

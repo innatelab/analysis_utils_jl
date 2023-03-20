@@ -1,6 +1,6 @@
 module ProtgroupAssembly
 
-using DataFrames, LightGraphs
+using DataFrames, Graphs
 using Printf: @sprintf
 
 # the relationship between the two sets of T elements

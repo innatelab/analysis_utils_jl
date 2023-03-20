@@ -14,7 +14,7 @@ const GenericColumnMap = Dict(
     :GENE => :gene_name, :SUB_GENE => :gene_name,
     :PROTEIN => :protein_name, :KINASE => :kinase_protein_name, :SUBSTRATE => :protein_name,
     :ACC_ID => :protein_ac, :KIN_ACC_ID => :kinase_protein_ac, :SUB_ACC_ID => :protein_ac,
-    :GENE_ID => :entrez_id, :SUB_GENE_ID=> :entrez_id,
+    :GENE_ID => :entrez_id, :SUB_GENE_ID=> :entrez_id, :SITE_GRP_ID => :psitep_sitegroup_id,
     :ORGANISM => :organism, :KIN_ORGANISM => :kinase_organism, :SUB_ORGANISM => :organism,
     Symbol("SITE_+/-7_AA") => :flanking_AAs,
     :DOMAIN => :domain,
@@ -43,10 +43,10 @@ function read_annotations(folder::AbstractString; verbose::Bool=false)
     res = Dict(begin
         verbose && @info "Reading $dsname from $filename..."
         if isfile(joinpath(folder, filename))
-            df = CSV.read(joinpath(folder, filename), header=4, threaded=false)
+            df = CSV.read(joinpath(folder, filename), DataFrame, header=4, threaded=false, delim = '\t')
         elseif isfile(joinpath(folder, filename * ".gz"))
             df = open(GzipDecompressorStream, joinpath(folder, filename * ".gz"), "r") do io
-                CSV.read(io, header=4, threaded=false)
+                CSV.read(io, DataFrame, header=4, threaded=false, delim = '\t')
             end
         end
         verbose && @info "  $(nrow(df)) $dsname annotations read"
@@ -76,25 +76,44 @@ function read_annotations(folder::AbstractString; verbose::Bool=false)
 end
 
 function combine_annotations(annot_dfs::AbstractDict)
-    phospho_annots_df = select(annot_dfs[:PhosphoSites], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code, :domain])
-    ubi_annots_df = select(annot_dfs[:UbiSites], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code, :domain])
+    phospho_annots_df = select(annot_dfs[:PhosphoSites], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code, :psitep_sitegroup_id, :domain])
+    ubi_annots_df = select(annot_dfs[:UbiSites], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code, :psitep_sitegroup_id, :domain])
     phubi_annots_df = vcat(phospho_annots_df, ubi_annots_df)
     phubi_annots_df[!, :ptm_is_known] .= true
-    ks_annots_df = combine(groupby(annot_dfs[:KinaseSubstrate], [:protein_ac, :ptm_pos, :ptm_AA]),
+    ks_annots_df = combine(groupby(annot_dfs[:KinaseSubstrate], [:protein_ac, :ptm_pos, :ptm_AA, :psitep_sitegroup_id]),
                            :kinase_gene_name => collapsevals => :kinase_gene_names)
-    regsite_annots_df = combine(groupby(annot_dfs[:RegSites], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code]),
+    regsite_annots_df = combine(groupby(annot_dfs[:RegSites], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code, :psitep_sitegroup_id]),
         :reg_function => collapsevals => :reg_function,
         :reg_prot_iactions => collapsevals => :reg_prot_iactions,
         :reg_other_iactions => collapsevals => :reg_other_iactions,
         :reg_pubmed_ids => collapsevals => :reg_pubmed_ids)
-    disease_annots_df = combine(groupby(annot_dfs[:DiseaseAssoc], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code]),
+    disease_annots_df = combine(groupby(annot_dfs[:DiseaseAssoc], [:protein_ac, :ptm_pos, :ptm_AA, :ptm_code, :psitep_sitegroup_id]),
                                 :disease => collapsevals => :diseases,
                                 :disease_pubmed_ids => collapsevals => :diseases_pubmed_ids)
-    annots_df = reduce((df1, df2) -> outerjoin(df1, df2, on=intersect(intersect([:protein_ac, :ptm_pos, :ptm_AA, :ptm_code],
+    combined_annot_dfs = [
+        :PhosphoAndUbiSites => phubi_annots_df,
+        :RegSites => regsite_annots_df,
+        :DiseaseAssoc => disease_annots_df,
+        :KinaseSubstrate => ks_annots_df, # KS should be the last as it doesn't have ptm_code
+    ]
+    # check for missing values
+    for (dfname, df) in combined_annot_dfs
+        df.is_valid = [!ismissing(r.protein_ac) && !ismissing(r.ptm_pos) &&
+                       !ismissing(r.ptm_AA) && !ismissing(r.psitep_sitegroup_id) &&
+                       (!hasproperty(r, :ptm_code) || !ismissing(r.ptm_code))
+                       for r in eachrow(df)]
+        if !all(df.is_valid)
+            @warn "$(sum(!, df.is_valid)) of $(nrow(df)) rows of $dfname have incomplete PTM definition, removing"
+            filter!(r -> r.is_valid, df)
+            disallowmissing!(df, [:protein_ac, :ptm_AA, :ptm_pos, :psitep_sitegroup_id])
+            hasproperty(df, :ptm_code) && disallowmissing(df, :ptm_code)
+        end
+        select!(df, Not(:is_valid))
+    end
+    combined_annots_df = reduce((df1, df2) -> outerjoin(df1, df2, on=intersect(intersect([:protein_ac, :ptm_pos, :ptm_AA, :ptm_code, :psitep_sitegroup_id],
                                                                       propertynames(df1), propertynames(df2)))),
-                       [phubi_annots_df, ks_annots_df,
-                        regsite_annots_df, disease_annots_df])
-    return annots_df
+                                last.(combined_annot_dfs))
+    return combined_annots_df
 end
 
 end

@@ -3,6 +3,14 @@ module FrameUtils
 using DataFrames, CategoricalArrays
 using Printf: @sprintf
 
+function categorical!(df::AbstractDataFrame, col::Union{Symbol, String}; levels=nothing, ordered::Bool=false)
+    df[!, col] .= categorical(convert(levels === nothing ? Vector : Vector{eltype(levels)}, df[!, col]),levels=levels, ordered=ordered)
+    return df
+end
+
+categorical!(df::AbstractDataFrame, cols::AbstractVector) =
+    reduce((df, col) -> categorical!(df, col), cols, init=df)
+
 # note: modifies dest
 function matchcategorical(dest::AbstractCategoricalArray, src::AbstractCategoricalArray;
                           allowmissing::Bool=false)
@@ -16,10 +24,10 @@ function matchcategorical(dest::AbstractCategoricalArray, src::AbstractCategoric
     return dest
 end
 
-matchcategorical(dest::AbstractArray, src::AbstractCategoricalArray;
-                 allowmissing::Bool=false) =
-    levels!(ordered!(categorical(dest), isordered(src)),
-            levels(src), allowmissing=allowmissing)
+function matchcategorical(dest::AbstractArray, src::AbstractCategoricalArray;
+                          allowmissing::Bool=false)
+    return categorical(dest, levels=levels(src), ordered=isordered(src))
+end
 
 function matchcategoricals!(dest::AbstractDataFrame, src::AbstractDataFrame;
                             cols::Union{Nothing, AbstractVector{Symbol}}=nothing,
@@ -43,18 +51,20 @@ function matchcategoricals!(dest::AbstractDataFrame, src::AbstractDataFrame;
 end
 
 """
-Convert
+    dropcategoricals!(df::DataFrame)
+
+Convert all categorical columns of `df` into non-categorical equivalents.
 """
 function dropcategoricals!(df::DataFrame)
     for col in names(df)
         if df[!, col] isa AbstractCategoricalVector
-            df[!, col] = get.(df[!, col])
+            df[!, col] = unwrap.(df[!, col])
         end
     end
     return df
 end
 
-dropcategoricals(df::AbstractDataFrame) = dropcategoricals!(copy(df, copycols=false))
+dropcategoricals(df::AbstractDataFrame; copycols=true) = dropcategoricals!(copy(df, copycols=copycols))
 
 AT(::Type{A}) where {A<:AbstractArray} = A
 AT(::Type{A}) where {A<:AbstractArray{T,N}} where {T>:Missing,N} = Array{nonmissingtype(T), N}
@@ -65,10 +75,17 @@ AT(::Type{A}) where {A<:AbstractCategoricalArray{T,N}} where {T, N} = A
 # FIXME replace in favor of dropmissing()?
 convert2nonmissing(a::AbstractArray) = convert(AT(typeof(a)), a)
 
-indexunique(::Type{T}, vals::AbstractVector) where T =
-    convert(Vector{T}, CategoricalArrays.refs(categorical(vals, compress=false)))
+function indexunique(::Type{T}, vals::AbstractVector;
+                     start::T=one(T), missingindex::Union{T,Missing}=zero(T),
+                     sort::Bool=true) where T
+    uniquevals = unique(vals)
+    sort && sort!(uniquevals)
+    offset = start - 1
+    val2ix = Dict(val => T(i + offset) for (i, val) in enumerate(uniquevals))
+    return get.(Ref(val2ix), vals, missingindex)
+end
 
-indexunique(vals::AbstractVector) = indexunique(Int, vals)
+indexunique(vals::AbstractVector; kwargs...) = indexunique(Int, vals; kwargs...)
 
 # multivalue version of unstack()
 function DataFrames.unstack(df::AbstractDataFrame,
@@ -76,19 +93,33 @@ function DataFrames.unstack(df::AbstractDataFrame,
                             colkey::Union{Integer, Symbol},
                             values::AbstractVector{<:Union{Integer, Symbol}};
                             sep::Union{String,Char}='_',
-                            namewidecols::Function = (valcol, time, sep) -> string(valcol, sep, time))
-    wide_dfs = Vector{DataFrame}()
-    cols = unique(df[!, colkey])
+                            namewidecols::Function = (valcol, colkey, sep) -> string(valcol, sep, colkey),
+                            widecol_groups::Symbol=:colkey)
+    wide_df = DataFrame()
+    widecol_groups ∈ [:value, :colkey] || throw(ArgumentError("Unsupported value widecol_groups=$(widecol_groups)"))
+    colgroup_poses = Vector{Int}()
     for val in values
-        wide_df = unstack(df, rowkeys, colkey, val,
-                          renamecols = col->namewidecols(val, col, sep))
-        if !isempty(wide_dfs) # exclude rowkeys cols from all but 1st wide_df
-            first(wide_dfs)[!, rowkeys] == wide_df[!, rowkeys] || error("Non-matching rowkeys")
-            select!(wide_df, Not(rowkeys))
+        val_df = unstack(df, rowkeys, colkey, val,
+                         renamecols = col->namewidecols(val, col, sep))
+        if !isempty(wide_df) # exclude rowkeys cols from all but 1st wide_df
+            isequal(wide_df[!, rowkeys], val_df[!, rowkeys]) || error("Non-matching rowkeys")
+            select!(val_df, Not(rowkeys))
+            if widecol_groups == :value # just append at the back of wide_df
+                for col in names(val_df) # should be faster than hcat()?
+                    insertcols!(wide_df, col => val_df[!, col])
+                end
+            elseif widecol_groups == :colkey
+                for (i, col) in enumerate(names(val_df)) # should be faster than hcat()?
+                    insertcols!(wide_df, colgroup_poses[i], col => val_df[!, col], after=true)
+                    colgroup_poses[i] += i # adjust by this and all the preceding columns inserted
+                end
+            end
+        else
+            wide_df = val_df
+            colgroup_poses = collect(length(rowkeys)+1:size(wide_df, 2))
         end
-        push!(wide_dfs, wide_df)
     end
-    hcat(wide_dfs...)
+    return wide_df
 end
 
 # multivariable version of DataFrames.stack()
@@ -100,7 +131,7 @@ function pivot_longer(df::AbstractDataFrame,
     mes_matches = match.(Ref(measure_vars_regex), names(df))
     if all(isnothing, mes_matches)
         @warn "No column matches measure_vars_regex"
-        return df[!, id_cols]
+        return select(df, id_cols)
     end
     # collect different values and corresponding columns in long format
     value2cols = Dict{Symbol, Vector{Pair{Symbol, Symbol}}}()
@@ -118,7 +149,7 @@ function pivot_longer(df::AbstractDataFrame,
     # remove variable_name column from all but first stacked frames
     vars = val_long_dfs[1][!, var_col]
     for i in 2:length(val_long_dfs)
-        @assert vars == val_long_dfs[i][!, var_col]
+        @assert isequal(vars, val_long_dfs[i][!, var_col])
         select!(val_long_dfs[i], Not(var_col))
     end
     # concatenate horizontally
@@ -129,7 +160,7 @@ end
 function array2frame(arr::AbstractArray{<:Number, N},
                      axes::Vararg{AbstractDataFrame, N};
                      data_col=:signal) where N
-    df=DataFrame((vec(arr), ), (data_col, ))
+    df = DataFrame(data_col => vec(arr))
     ninner = 1
     for (i, axis_df) in enumerate(axes)
         axis_rowixs = repeat(1:size(axis_df, 1), inner=ninner, outer=size(df, 1)÷(ninner*size(axis_df, 1)))
@@ -162,7 +193,7 @@ return it along with the axes dataframes (as a 2-tuple).
 """
 function frame2array(data_df::AbstractDataFrame,
                      axes::AbstractVector{Vector{Symbol}};
-                     data_col::Symbol=:signal,
+                     data_col::Union{Symbol, Nothing}=:signal,
                      missed=nothing, default=missing,
                      verbose::Bool=false)
     verbose && @info("Extracting the axes and indexing the frame...")
@@ -185,7 +216,9 @@ function frame2array(data_df::AbstractDataFrame,
         end
         push!(axes_dfs, axis_df)
     end
-    data_v = missed === nothing ? data_df[!, data_col] : coalesce.(data_df[!, data_col], missed)
+    data_v = isnothing(data_col) ?
+        fill(true, nrow(data_df)) :
+        isnothing(missed) ? data_df[!, data_col] : coalesce.(data_df[!, data_col], missed)
     verbose && @info("Reshaping into $(length(axes))-tensor...")
     res = _frame2array(data_v, ntuple(i -> axes_dfs[i], length(axes)), axes_ixs, default)
     return res, axes_dfs
@@ -231,7 +264,7 @@ function collection2frame(coll::AbstractDict{<:Any, <:Set},
             push!(obj_ids, obj_id)
         end
     end
-    res_df = DataFrame((set_ids, obj_ids), (setid_col, objid_col))
+    res_df = DataFrame(setid_col => set_ids, objid_col => obj_ids)
     if set2coll_df !== nothing
         res_df = leftjoin(res_df, set2coll_df[!, [collid_col, setid_col]],
                           on = :term_id)
@@ -243,7 +276,8 @@ function frame2collections(df::AbstractDataFrame;
     obj_col::Symbol = :protgroup_id,
     set_col::Symbol = :set_id,
     coll_col::Symbol = :src,
-    verbose::Bool = true
+    verbose::Bool = true,
+    kwargs...
 )
     # convert back to collection of sets
     ObjType = eltype(df[!, obj_col])
@@ -253,7 +287,7 @@ function frame2collections(df::AbstractDataFrame;
     for coll_subdf in groupby(df, coll_col, sort=false);
         coll_id = Symbol(string(coll_subdf[1, coll_col]))
         verbose && @info("Processing $coll_id annotation collection...")
-        coll_sets = frame2collection(coll_subdf, obj_col=obj_col, set_col=set_col)
+        coll_sets = frame2collection(coll_subdf; obj_col, set_col, kwargs...)
         colls[coll_id] = coll_sets
         verbose && @info("  $(length(coll_sets)) set(s) processed")
     end

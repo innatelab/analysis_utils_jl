@@ -1,9 +1,10 @@
 module PTMExtractor
 
-using DataFrames, Printf
+using DataFrames, Printf, CategoricalArrays
 using BioSequences, BioAlignments
 
 const DelimDataUtils = Main.DelimDataUtils
+using ..FrameUtils
 
 # spectronaut-specific extraction of protein(ac)-to-peptide matches
 function peptide_matches(peptides_df::AbstractDataFrame;
@@ -26,7 +27,7 @@ function peptide_matches(peptides_df::AbstractDataFrame;
     return select!(pos_df, Not(:rowix))
 end
 
-# find peptide occurrenes in the sequences
+# find peptide occurrences in the sequences
 function match_peptides(peptides_df::AbstractDataFrame,
                         seqs::Union{Nothing, AbstractDict}=nothing;
                         protein_acs_col::Symbol=:peptide_protein_acs)
@@ -145,7 +146,7 @@ function extract_ptms(df::AbstractDataFrame,
         obj_ptmstats_df[i, :nptms] = nptms
         obj_ptmstats_df[i, :nselptms] = nselptms
     end
-    categorical!(ptms_df, [:ptm_type, :ptm_AAs])
+    FrameUtils.categorical!(ptms_df, [:ptm_type, :ptm_AAs])
     rename!(ptms_df, :object_id=>objid_col), obj_ptmstats_df
 end
 
@@ -205,9 +206,6 @@ function append_ptm_locprobs!(out::AbstractDataFrame,
                 continue # skip ptm if it's not in the modified sequence (locprob too low)
             else
                 cur_ptm_type = isnothing(ptm_type) ? m[:type] : ptm_type
-                #if (aa != ptms_df.ptm_AA_seq[ptm_ix]) || (ptms_df.ptm_type[ptm_ix] != cur_ptm_type)
-                #    @show modseq locprobseq ptms_df offset ptm_ix aa ptms_df.ptm_AA_seq[ptm_ix]
-                #end
                 @assert aa == ptms_df.ptm_AA_seq[ptm_ix] "object_id=$(object_id), pos=$(ptm_ix): Found AA=$aa, expected $(ptms_df.ptm_AA_seq[ptm_ix])"
                 # allow PTM type mismatch if pepmodseq one is terminal modification
                 @assert (ptms_df.ptm_type[ptm_ix] == cur_ptm_type) ||
@@ -242,7 +240,7 @@ function extract_ptm_locprobs(df::AbstractDataFrame,
                                  isnothing(modseq_col) ? nothing : r[modseq_col],
                                  ptmsbuf_df)
     end
-    categorical!(res, [:ptm_type])
+    FrameUtils.categorical!(res, [:ptm_type])
     rename!(res, :object_id=>objid_col)
     if msrun_col isa Symbol
         rename!(res, :msrun_id => msrun_col)
@@ -309,7 +307,7 @@ function map_aapos(aaobjs_df::AbstractDataFrame,
     src2dest_df.src2dest_ix = 1:nrow(src2dest_df)
     verbose && @info "Calculating $(nrow(src2dest_df)) pairwise alignments of $(nrow(used_srcseqs_df2)) source $(obj_prefix) seqs to $(nrow(destseqs_df2)) $(destmap_prefix) seqs..."
     src2dest_agns = [pairalign(GlobalAlignment(),
-                        LongAminoAcidSeq(srcseqs_df.seq[r.srcseq_ix]), LongAminoAcidSeq(destseqs_df.seq[r.destseq_ix]),
+                        LongAA(srcseqs_df.seq[r.srcseq_ix]), LongAA(destseqs_df.seq[r.destseq_ix]),
                         scoremodel)
                      for r in eachrow(src2dest_df)]
     obj2dest_df = leftjoin(objs_df2, src2dest_df, on=srcseqid_col)
@@ -327,7 +325,7 @@ function map_aapos(aaobjs_df::AbstractDataFrame,
         (!ismissing(r.src2dest_ix) && (r[objpos_col] <= r.srcseq_len)) || continue
         agn = alignment(src2dest_agns[r.src2dest_ix])
         aln = agn.a.aln
-        s2a = seq2agn(agn, r[objpos_col])
+        s2a = seq2aln(agn, r[objpos_col])
         s2r = seq2ref(agn, r[objpos_col])
         r[agnpos_col] = s2a[1]
         r[agnmatchratio_col] = count_matches(agn) / count_aligned(agn)
@@ -344,7 +342,7 @@ function map_aapos(aaobjs_df::AbstractDataFrame,
 end
 
 default_ptm_labeler(r::Any; groupid_col::Symbol=:genename, obj_prefix::Symbol=:ptm_, idextra::Any=nothing) =
-    coalesce(r[Symbol(obj_prefix, "type")], "Unknown") * "_" * string(coalesce(r[groupid_col], "Unknown")) *
+    coalesce(string(r[Symbol(obj_prefix, "type")]), "Unknown") * "_" * string(coalesce(r[groupid_col], "Unknown")) *
     (isnothing(idextra) ? "" : string("-", idextra)) * "_" *
     r[Symbol(obj_prefix, "AA_seq")] * string(r[Symbol(obj_prefix, "pos")])
 
@@ -445,7 +443,7 @@ function group_aaobjs(
     aaobjs_df2[!, objgroupid_col] = groupid[obj2group]
     if !isnothing(seqrank_col)
         # assign group id using the position in highest-ranking sequence
-        objisref_col = Symbol(obj_prefix, :is_reference) 
+        objisref_col = Symbol(obj_prefix, :is_reference)
         aaobjs_df2[!, objisref_col] .= false
         aaobjs_df2[!, objgrouplabel_col] .= ""
         label2id = Dict{String, Int}()
@@ -484,18 +482,18 @@ function setgroup_frame(df::AbstractDataFrame, setgroup_col::Symbol, setid_col::
     if !isnothing(group_cols)
         append!(res_names, group_cols)
         for col in group_cols
-            T = eltype(df[col])
+            T = eltype(df[!, col])
             push!(KTypes, T)
             push!(res_cols, Vector{T}())
         end
     end
-    E = eltype(df[elem_col])
-    S = eltype(df[setid_col])
+    E = eltype(df[!, elem_col])
+    S = eltype(df[!, setid_col])
     push!(res_cols, Int[]); push!(res_names, setgroup_col)
     push!(res_cols, S[]); push!(res_names, setid_col)
     push!(KTypes, Set{E})
     K = Tuple{KTypes...}
-    T = eltype(df[setid_col])
+    T = eltype(df[!, setid_col])
     els2sets = elements2sets!(Dict{K, Vector{S}}(), df, setid_col, elem_col, group_cols)
     for (i, (key, setids)) in enumerate(els2sets)
         for setid in setids

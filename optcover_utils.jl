@@ -18,7 +18,7 @@ function collection2mosaic(sets::AbstractDict{S, Set{T}},
                    foldl(union!, values(ref_sets), init=copy(ref_objs)) :
                    nothing
         set_relevances = Dict(begin
-            ref_set = ref_sets[set_id]
+            ref_set = get(ref_sets, set_id, Set{TR}())
             set_id => set_relevance(length(intersect(ref_set, ref_objs)),
                                     length(ref_set), length(ref_objs), length(all_refs))
         end for set_id in keys(sets))
@@ -36,8 +36,8 @@ function collections2mosaics(colls::AbstractDict{Symbol, <:AbstractDict},
                              verbose::Bool = false)
     Dict(begin
         verbose && @info("preparing $coll_id mosaic...")
-        mosaic = collection2mosaic(sets, ref_colls !== nothing ? ref_colls[coll_id] : nothing, ref_objs,
-                                   setXset_frac_extra_elms=setXset_frac_extra_elms)
+        mosaic = collection2mosaic(sets, ref_colls !== nothing ? ref_colls[coll_id] : nothing, ref_objs;
+                                   setXset_frac_extra_elms)
         verbose && @info("done $coll_id ($(length(sets)) set(s), $(ntiles(mosaic)) tile(s))")
         coll_id => mosaic
     end for (coll_id, sets) in pairs(colls))
@@ -62,6 +62,25 @@ function automask(mosaic::SetMosaic, masks;
         end
         max_log10_pvalue -= 0.5
         max_min_log10_pvalue -= 0.5
+    end
+end
+
+function autoweight(mosaic::SetMosaic, weights;
+                  max_sets::Integer=2500,
+                  max_setsize::Union{Integer, Nothing} = nothing,
+                  max_min_weight::Number = 0.01,
+                  max_weight::Number = max_min_weight+1,
+                  verbose::Bool = false)
+    while true
+        weighted_mosaic = assignweights(mosaic, weights,
+                             max_setsize=max_setsize,
+                             max_weight=max_weight, max_min_weight=max_min_weight)
+        verbose && @info("$(nsets(weighted_mosaic)) set(s) (max weight=$max_weight, max min(weight)=$max_min_weight)")
+        if nsets(weighted_mosaic) <= max_sets
+            return weighted_mosaic
+        end
+        max_weight -= 0.5
+        max_weight -= 0.5
     end
 end
 
@@ -135,17 +154,22 @@ function filter_multicover(multicover_df::AbstractDataFrame;
     (minolap_entry > minolap_set) &&
         @warn("min_entry_overlap ($min_entry_overlap) is more stringent than min_set_overlap ($min_set_overlap)")
 
+    hasmask = "nmasked" ∈ names(multicover_df)
+    weight_col = "set_overlap_log10pvalue"
+    if weight_col ∉ names(multicover_df)
+        weight_col = "set_original_weight"
+    end
     terms_v = tuplecol(multicover_df, tuple(term_cols...))
     sets_v = tuplecol(multicover_df, tuple(set_cols...))
-    term_ids = Set(terms_v[(multicover_df.nmasked .>= max(minolap_term, minolap_set, minolap_entry)) .&
-                           (multicover_df.set_overlap_log10pvalue .<= log10(min(maxpval_term, maxpval_set, maxpval_entry)))])
+    term_ids = Set(terms_v[(!hasmask || (multicover_df.nmasked .>= max(minolap_term, minolap_set, minolap_entry))) .&
+                           (coalesce.(multicover_df[!, weight_col], 0.0) .<= log10(min(maxpval_term, maxpval_set, maxpval_entry)))])
     set_ids = Set(sets_v[(terms_v .∈ Ref(term_ids)) .&
-                         (multicover_df.nmasked .>= max(minolap_set, minolap_entry)) .&
-                         (multicover_df.set_overlap_log10pvalue .<= log10(min(maxpval_set, maxpval_entry)))])
+                         (!hasmask || (multicover_df.nmasked .>= max(minolap_set, minolap_entry))) .&
+                         (coalesce.(multicover_df[!, weight_col], 0.0) .<= log10(min(maxpval_set, maxpval_entry)))])
     @info "  $(length(term_ids))/$(length(Set(terms_v))) significant terms, $(length(set_ids))/$(length(Set(sets_v))) significant sets"
     return multicover_df[(sets_v .∈ Ref(set_ids)) .& (terms_v .∈ Ref(term_ids)) .&
-                         (multicover_df.nmasked .>= minolap_entry) .&
-                         (multicover_df.set_overlap_log10pvalue .<= log10(maxpval_entry)), :]
+                         (!hasmask || (multicover_df.nmasked .>= minolap_entry)) .&
+                         (coalesce.(multicover_df[!, weight_col], 0.0) .<= log10(maxpval_entry)), :]
 end
 
 include(joinpath(@__DIR__, "covers_report.jl"))

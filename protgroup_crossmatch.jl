@@ -77,7 +77,7 @@ rank_uniprot(uprot::DataFrameRow) =
         acmatch = match(UniprotIsoformRegex, uprot.protein_ac)
         isnothing(acmatch) ? 0 : parse(Int, acmatch[2]) - 1
     end +
-    ifelse(uprot.src_db == "sp", 0, 3) +
+    ifelse(coalesce(uprot.src_db, "") == "sp", 0, 3) +
     convert(Int, coalesce(uprot.protein_existence, 7)) - 1
 
 """

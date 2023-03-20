@@ -7,20 +7,23 @@ const BBOUtils = Main.BBOUtils
 
 import .MSInstrument.MSErrorModel
 
-function prior_probability_log(model::MSErrorModel, intensity_range::AbstractArray)
+function logprior(model::MSErrorModel, intensity_range::AbstractArray;
+                  sigma_prior_sd::Number = 0.1,
+                  n::Integer = length(intensity_range))
   res = 0.0
   zPrior = Cauchy(0, 1)
   res += logpdf(zPrior, model.zDetectionIntercept)
   res += logpdf(zPrior, model.zDetectionFactor)
-  stdPrior = Laplace(0, 0.01)
-  # minimize std over the intensity range
+  stdPrior = Normal(0.0, sigma_prior_sd)
+  # prior to minimize std over the intensity range
   res += sum(x -> logpdf(stdPrior, MSInstrument.signal_std(model, x)/x),
-             intensity_range)
+             intensity_range) * n / length(intensity_range) # scale by total number of observations
   res += logpdf(Beta(10.0, 1.1), model.detectionMax)
   return res
 end
 
 function reference_intensities(intensities::AbstractArray{<:Real};
+                               logintensityBase::Number=2,
                                quantile_range::Union{Tuple{Number, Number}, Number} = 0.99,
                                nbins::Integer=20)
     if quantile_range isa Number
@@ -29,15 +32,16 @@ function reference_intensities(intensities::AbstractArray{<:Real};
     else
         qtile_min, qtile_max = quantile_range
     end
-    logintens_min = floor(log(quantile(intensities, qtile_min)))
-    logintens_max = ceil(log(quantile(intensities, qtile_max)))
-    return exp.(LinRange(logintens_min, logintens_max, nbins))
+    logintens_min = floor(log(logintensityBase, quantile(intensities, qtile_min)))
+    logintens_max = ceil(log(logintensityBase, quantile(intensities, qtile_max)))
+    return logintensityBase.^LinRange(logintens_min, logintens_max, nbins)
 end
 
 """
 Data for `MSErrorCalibrationProblem`.
 """
 struct MSErrorCalibrationData
+    logintensityBase::Float64
     zScale::Float64
     zShift::Float64
     intensity_bins::Vector{Float64}
@@ -51,7 +55,7 @@ struct MSErrorCalibrationData
     shifts_df::DataFrame
 end
 
-Base.length(data::MSErrorCalibrationData) = length(data.zscore)
+Base.length(data::MSErrorCalibrationData) = length(data.intensity)
 
 function MSErrorCalibrationData(data, mschannels::AbstractDataFrame;
         object::Symbol = :protgroup,
@@ -125,17 +129,18 @@ function MSErrorCalibrationData(intensities::DataFrame,
     exp_col::Symbol = :experiment,
     mstag_col::Union{Symbol,Nothing} = nothing,
     intensity_col::Symbol = :intensity,
+    logintensityBase::Number = 2,
     nbins::Integer = 20,
     bin_oversize::Number = 2,
     quantile_range::Union{Tuple{Number, Number}, Number} = 0.99,
     max_objXexp::Union{Integer, Nothing} = nothing,
-    missed_intensity_factor::Number = 1.0, # how much to adjust the predicted intensity for each missing value
-    error_scale::Number = 1.0 # how much the predicted error is scaled (would like to scale down if data are not tech. replicates)
+    error_scale::Union{Nothing, Number} = nothing,
+    missed_intensity_factor::Number = 1.0 # how much to adjust the predicted intensity for each missing value
 )
     mschannel_idcols = [msrun_col]
     isnothing(mstag_col) || push!(mschannel_idcols, mstag_col)
     mschannel_cols = vcat(mschannel_idcols, [exp_col])
-    mschannels = mschannels[!, mschannel_cols]
+    mschannels = select(mschannels, mschannel_cols)
     if !isnothing(mstag_col)
         expchannel_col = Symbol(string(exp_col), "X", string(mstag_col))
         mschannels[!, expchannel_col] = categorical(coalesce.(mschannels[!, exp_col], "") .*
@@ -150,11 +155,14 @@ function MSErrorCalibrationData(intensities::DataFrame,
     mschannels.is_used = mschannels[!, expchannel_col] .∈ Ref(expchannels_used)
     @info "Using $(sum(mschannels.is_used)) of $(size(mschannels, 1)) mschannels(s) (tech. replicates)"
 
-    intensities = innerjoin(semijoin(intensities[[!ismissing(i) && isfinite(i) && i > 0.0 for i in intensities[!, intensity_col]],
-                                        vcat([intensity_col, object_col], mschannel_idcols)],
-                            objects[objects[!, obj_use_col], [object_col]], on=object_col),
-                       mschannels[mschannels.is_used, vcat(mschannel_idcols, [expchannel_col])],
-                       on=mschannel_idcols)
+    intensities = semijoin(select!(filter(r -> begin i = r[intensity_col]; coalesce(i, 0.0) > 0.0 && isfinite(i) end, intensities),
+                                   vcat([intensity_col, object_col], mschannel_idcols)),
+                           select!(filter(r -> r[obj_use_col], objects), [object_col]),
+                           on=object_col, matchmissing=:notequal)
+    intensities = innerjoin(intensities,
+                            select!(filter(r -> r.is_used, mschannels),
+                                    vcat(mschannel_idcols, [expchannel_col])),
+                            on=mschannel_idcols, matchmissing=:notequal)
     @assert !any(ismissing, intensities[!, intensity_col])
     # all objectXexperiment pairs, where at least one quantification available
     objXexp = unique(intensities[!, [object_col, expchannel_col]])
@@ -165,7 +173,7 @@ function MSErrorCalibrationData(intensities::DataFrame,
     intens_qtl_col = Symbol(string(intensity_col), "_qtl")
     intens_rank_col = Symbol(string(intensity_col), "_rank")
     (intensity_col != :intensity) && rename!(intensities, intensity_col => :intensity)
-    intensities.logintensity = log.(intensities.intensity)
+    intensities.logintensity = log.(logintensityBase, intensities.intensity)
 
     @info "Calculating MS run shifts..."
     shifts_df = combine(groupby(semijoin(intensities, objects, on=object_col), expchannel_col)) do df
@@ -193,11 +201,11 @@ function MSErrorCalibrationData(intensities::DataFrame,
             med_shift = median(logintensity_shifts, w)
             DataFrame(logshift = med_shift,
                       logshift_sd = std(logintensity_shifts .- med_shift, w),
-                      n = size(subdf, 1))
+                      npairs = size(subdf, 1))
         end
     end
 
-    shifts_df.mult = exp.(shifts_df.logshift)
+    shifts_df.mult = logintensityBase.^(shifts_df.logshift)
     @info "MS experiments normalization:\n$shifts_df"
 
     intensities_expanded = innerjoin(semijoin(objXexp, objects[objects[!, obj_use_col], [object_col, obj_use_col]],
@@ -230,7 +238,7 @@ function MSErrorCalibrationData(intensities::DataFrame,
 
     intensities_expanded = leftjoin(intensities_expanded, expchanXobj_df, on=[expchannel_col, object_col])
     intensities_expanded.intensity_predicted = intensities_expanded.intensity_norm_predicted_corr .* intensities_expanded.mult
-    intensities_expanded.logintensity_predicted = log.(intensities_expanded.intensity_predicted)
+    intensities_expanded.logintensity_predicted = log.(logintensityBase, intensities_expanded.intensity_predicted)
     intensities_expanded.intensity_prediction_error = intensities_expanded.intensity_predicted .- intensities_expanded.intensity
 
     usable_perbin = countmap(expchanXobj_df.intensity_bin)
@@ -256,53 +264,71 @@ function MSErrorCalibrationData(intensities::DataFrame,
     zScale = 1.0/std(skipmissing(intensities_used.logintensity))
     intensities_used.intensity_zscore = (intensities_used.logintensity .- zShift) .* zScale
     intensities_used.intensity_prediction_error = intensities_used.intensity_predicted .- intensities_used.intensity
+    if !isnothing(error_scale)
+        @info "Scaling predicted errors by error_scale=$(error_scale)"
+        intensities_used.intensity_prediction_error .*= error_scale
+    end
     intensities_used.intensity_zscore_predicted = (intensities_used.logintensity_predicted .- zShift) .* zScale
 
-    return MSErrorCalibrationData(zScale, zShift, ref_intensities,
-                                  coalesce.(intensities_used.intensity, NaN),
-                                  coalesce.(intensities_used.logintensity_predicted, NaN),
-                                  coalesce.(intensities_used.intensity_zscore_predicted, NaN),
-                                  coalesce.(error_scale .* intensities_used.intensity_prediction_error, NaN),
-                                  intensities_used,
-                                  shifts_df)
+    return MSErrorCalibrationData(logintensityBase,
+            zScale, zShift, ref_intensities,
+            coalesce.(intensities_used.intensity, NaN),
+            coalesce.(intensities_used.logintensity_predicted, NaN),
+            coalesce.(intensities_used.intensity_zscore_predicted, NaN),
+            coalesce.(intensities_used.intensity_prediction_error, NaN),
+            intensities_used,
+            shifts_df)
 end
 
 reference_intensities(data::MSErrorCalibrationData) =
-    reference_intensities(data.intensity_bins)
+    reference_intensities(data.intensity_bins; logintensityBase=data.logintensityBase)
 
-function likelihood_log(model::MSErrorModel, data::MSErrorCalibrationData)
+function loglikelihood(model::MSErrorModel, data::MSErrorCalibrationData;
+                       verbose::Bool=false)
     res = 0.0
-    noiseDistr = Laplace(0.0, 1.0)
     min_detect_logprob = log(1E-3) # TODO configurable
+    nsignals = 0
+    noutliers = 0
     @inbounds for i in eachindex(data.intensity_zscore_predicted)
         if isfinite(data.intensity_error[i])
-            logprec = -MSInstrument.zscore_logstd(model, data.intensity_zscore_predicted[i])
             if data.intensity_error[i] != 0 # skip 0 errors (single quant for an object)
-                res += logprec + logpdf(noiseDistr, exp(logprec) * data.intensity_error[i])
+                llh, issignal = MSInstrument.zscore_loglikelihood_and_class(model, data.intensity_error[i], data.intensity_zscore_predicted[i])
+                res += llh
+                nsignals += issignal
+                noutliers += !issignal
             end
-            res += max(min_detect_logprob, MSInstrument.detection_likelihood_log(model, true, data.logintensity_predicted[i]))
+            res += max(min_detect_logprob, MSInstrument.detection_loglikelihood(model, true, data.logintensity_predicted[i]))
         else
-            res += max(min_detect_logprob, MSInstrument.detection_likelihood_log(model, false, data.logintensity_predicted[i]))
+            res += max(min_detect_logprob, MSInstrument.detection_loglikelihood(model, false, data.logintensity_predicted[i]))
         end
         #print( "error=", data.error[i] ," zscore=", data.zscore[i], " expected=", data.expected_log[i], " τ=", zscore_precision(model, data.zscore[i]), " llh=", res, " " )
-        #if !isfinite(res) error("Infinite likelihood at $i: $model") end
+        #if !isfinite(res) error("Infinite loglikelihood at $i: $model") end
     end
-    return res
+    outliers_freq_llh = logpdf(Beta(noutliers + 1, nsignals + 1),
+                               MSInstrument.outlierProb(model.distr))
+    if (verbose)
+        @show nsignals noutliers noutliers/(nsignals + noutliers) outliers_freq_llh
+    end
+    return res + outliers_freq_llh
 end
 
-struct MSErrorModelFactory
+struct MSErrorModelFactory{B}
     # log(signal) to zscore transformation
     zScale::Float64
     zShift::Float64
+    outlierProb::Float64
+
     param_bounds::Vector{ParamBounds}
 
     function MSErrorModelFactory(
         zScale::Float64,
         zShift::Float64;
+        logintensityBase::Number = 2,
+        outlierProb::Number = MSInstrument.DefaultOutlierProb,
         detectionMaxMin::Number = 0.0
     )
         zScale > 0 || throw(ArgumentError("zScale should be positive ($zScale found)"))
-        new(zScale, zShift,
+        new{logintensityBase}(zScale, zShift, outlierProb,
             [(0.0, 100.0), (-50.0, 50.0), # zDetectionFactor & intercept
              (Float64(detectionMaxMin), 1.0), # detectionMax
              (0.0, 1.0/zScale), (0.0, 1.0/zScale), # scale hi/lo
@@ -315,10 +341,14 @@ end
 nparams(factory::MSErrorModelFactory) = length(factory.param_bounds)
 
 # uninitialized model
-emptymodel(factory::MSErrorModelFactory) = MSErrorModel(factory.zScale, factory.zShift)
+emptymodel(factory::MSErrorModelFactory{B}) where B =
+    MSErrorModel{B}(factory.zScale, factory.zShift,
+                    outlierProb=factory.outlierProb)
 
-function params2model!(model::MSErrorModel, factory::MSErrorModelFactory, params::AbstractVector)
-    length(params)==nparams(factory) || throw(DimensionMismatch("Length of parameters vector and factory model parameters differ"))
+function params2model!(model::MSErrorModel{B}, factory::MSErrorModelFactory{B},
+                       params::AbstractVector) where B
+    length(params)==nparams(factory) ||
+        throw(DimensionMismatch("Length of parameters vector and factory model parameters differ"))
     model.zDetectionFactor = params[1]
     model.zDetectionIntercept = params[2]
     model.detectionMax = params[3]
@@ -330,7 +360,8 @@ function params2model!(model::MSErrorModel, factory::MSErrorModelFactory, params
     MSInstrument.sync!(model)
 end
 
-params2model(factory::MSErrorModelFactory, params::AbstractVector) = params2model!(emptymodel(factory), factory, params)
+params2model(factory::MSErrorModelFactory, params::AbstractVector) =
+    params2model!(emptymodel(factory), factory, params)
 
 struct BayesianLogprobAggregator
     prior_weight::Float64
@@ -353,22 +384,25 @@ prior_weight(fitscheme::BayesianLogprobMaximization) = aggregator(fitscheme).pri
 """
 `BlackBoxOptim` wrapper for fitting `MSErrorModel`.
 """
-mutable struct MSErrorCalibrationProblem{FS} <: OptimizationProblem{FS}
-    fitness_scheme::FS
-    factory::MSErrorModelFactory
+mutable struct MSErrorCalibrationProblem{FS,B} <: OptimizationProblem{FS}
     data::MSErrorCalibrationData
     intensity_range::Vector{Float64}
+    sigma_prior_sd::Float64
+
+    fitness_scheme::FS
+    factory::MSErrorModelFactory{B}
     search_space::ContinuousRectSearchSpace
     models_pool_lock::Threads.SpinLock
-    models_pool::Vector{MSErrorModel}
+    models_pool::Vector{MSErrorModel{B}}
 
-    MSErrorCalibrationProblem(factory::MSErrorModelFactory, data::MSErrorCalibrationData;
+    MSErrorCalibrationProblem(factory::MSErrorModelFactory{B}, data::MSErrorCalibrationData;
                               fitness_scheme::FitnessScheme = BayesianLogprobMaximization(),
-                              intensity_range = reference_intensities(data)) =
-        new{typeof(fitness_scheme)}(fitness_scheme, factory, data,
-            intensity_range,
-            RectSearchSpace(factory.param_bounds),
-            Threads.SpinLock(), Vector{MSErrorModel}())
+                              intensity_range = reference_intensities(data),
+                              sigma_prior_sd::Number = 0.1) where B =
+        new{typeof(fitness_scheme),B}(
+            data, intensity_range, sigma_prior_sd,
+            fitness_scheme, factory, RectSearchSpace(factory.param_bounds),
+            Threads.SpinLock(), Vector{MSErrorModel{B}}())
 end
 
 BlackBoxOptim.name(::MSErrorCalibrationProblem{FS}) where FS = "MSErrorCalibrationProblem{$FS}"
@@ -384,13 +418,14 @@ BlackBoxOptim.show_fitness(io::IO, score::NTuple{2,Float64}, problem::MSErrorCal
 BlackBoxOptim.show_fitness(io::IO, score::IndexedTupleFitness{2,Float64}, problem::MSErrorCalibrationProblem) =
     BlackBoxOptim.show_fitness(io, score.orig, problem)
 
-function prior_and_likelihood_logs(x, p::MSErrorCalibrationProblem)
+function logprior_and_loglikelihood(x, p::MSErrorCalibrationProblem)
     lock(p.models_pool_lock)
     tmp_model = isempty(p.models_pool) ? emptymodel(p.factory) : pop!(p.models_pool)
     unlock(p.models_pool_lock)
     params2model!(tmp_model, p.factory, x)
-    res = (prior_probability_log(tmp_model, p.intensity_range),
-           likelihood_log(tmp_model, p.data))
+    res = (logprior(tmp_model, p.intensity_range,
+                    sigma_prior_sd = p.sigma_prior_sd, n = length(p.data)),
+           loglikelihood(tmp_model, p.data))
     lock(p.models_pool_lock)
     push!(p.models_pool, tmp_model)
     unlock(p.models_pool_lock)
@@ -399,17 +434,28 @@ end
 
 # Evaluate fitness of a candidate solution on the 1st objective function of a problem.
 BlackBoxOptim.fitness(x, p::MSErrorCalibrationProblem{BayesianLogprobMaximization}) =
-    prior_and_likelihood_logs(x, p)
+    logprior_and_loglikelihood(x, p)
 
 BlackBoxOptim.fitness(x, p::MSErrorCalibrationProblem{<:ScalarFitnessScheme}) =
-    sum(prior_and_likelihood_logs(x, p))
+    sum(logprior_and_loglikelihood(x, p))
 
 function BlackBoxOptim.bbsetup(data::MSErrorCalibrationData;
                       fitness_scheme=BayesianLogprobMaximization(),
                       detectionMaxMin::Number=0.0,
+                      logintensityBase::Number=2,
+                      outlierProb::Number=MSInstrument.DefaultOutlierProb,
+                      sigma_prior_sd::Number=0.1,
+                      intensity_range = reference_intensities(data),
                       kwargs...)
+    (data.logintensityBase != logintensityBase) &&
+        error("logintensityBase mismatch (data has $(data.logintensityBase), model wants $(logintensityBase))")
     problem = MSErrorCalibrationProblem(
-        MSErrorModelFactory(data.zScale, data.zShift, detectionMaxMin=detectionMaxMin), data,
+        MSErrorModelFactory(data.zScale, data.zShift,
+                            logintensityBase=logintensityBase,
+                            outlierProb=outlierProb,
+                            detectionMaxMin=detectionMaxMin),
+        data, sigma_prior_sd=sigma_prior_sd,
+        intensity_range = intensity_range,
         fitness_scheme=fitness_scheme)
     return bbsetup(BBOUtils.DefaultFactory(problem; kwargs...); kwargs...)
 end
